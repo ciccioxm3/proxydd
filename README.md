@@ -1,4 +1,4 @@
-Fork fatto da https://github.com/nzo66/tvproxy riadattato il codice solo per far funzionare DD
+Fork fatto da https://github.com/nzo66/tvproxy (lasciate una stella nel repo originale) riadattato il codice solo per far funzionare DD
 
 # HOW TO USE
 
