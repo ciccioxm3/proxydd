@@ -2,7 +2,7 @@ Fork fatto da https://github.com/nzo66/tvproxy (lasciate una stella nel repo ori
 
 # HOW TO USE
 
-<https://proxy-url>/proxy/m3u?url=<https://link/gia/risolto/mono.m3u8>
+<<https://proxy-url>>/proxy/m3u?url=<<https://link/gia/risolto/mono.m3u8>>
 
 
 riporto il readme di https://github.com/nzo66/tvproxy
