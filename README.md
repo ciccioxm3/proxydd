@@ -1,8 +1,10 @@
 Fork fatto da https://github.com/nzo66/tvproxy (lasciate una stella nel repo originale) riadattato il codice solo per far funzionare DD
 
 # HOW TO USE
-
+link gia risolto
 <<https://proxy-url>>/proxy/m3u?url=<<https://link/gia/risolto/mono.m3u8>>
+
+link php
 <<https://proxy-url>>/proxy/m3u?url=<<https://dldh.dd/embed/stream-879.php>>
 
 riporto il readme di https://github.com/nzo66/tvproxy
