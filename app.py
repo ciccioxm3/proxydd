@@ -3,8 +3,34 @@ import requests
 from urllib.parse import urlparse, urljoin, quote, unquote
 import re
 import traceback
+import time
+from threading import Lock
 
 app = Flask(__name__)
+
+# --- CACHE IN MEMORIA SEMPLICE ---
+CACHE_TTL = 60  # secondi, puoi aumentare se vuoi
+ts_cache = {}
+key_cache = {}
+cache_lock = Lock()
+
+# Aggiungi queste funzioni per gestire la cache
+def set_in_cache(cache_dict, key, value):
+    """Salva un valore nella cache con timestamp"""
+    with cache_lock:
+        cache_dict[key] = (time.time(), value)
+
+def get_from_cache(cache_dict, key):
+    """Ottiene un valore dalla cache se non è scaduto"""
+    with cache_lock:
+        if key in cache_dict:
+            timestamp, value = cache_dict[key]
+            if time.time() - timestamp < CACHE_TTL:
+                return value
+            else:
+                # Rimuovi l'elemento scaduto
+                del cache_dict[key]
+    return None
 
 def detect_m3u_type(content):
     """ Rileva se è un M3U (lista IPTV) o un M3U8 (flusso HLS) """
@@ -229,7 +255,7 @@ def proxy_m3u():
 
         if file_type == "m3u":
             # Gestisci playlist M3U (non stream M3U8)
-            return Response(m3u_content, content_type="audio/x-mpegurl")
+            return Response(m3u_content, content_type="application/vnd.apple.mpegurl")
 
         # Processa contenuto M3U8
         parsed_url = urlparse(final_url)
@@ -301,7 +327,7 @@ def proxy_resolve():
 
 @app.route('/proxy/ts')
 def proxy_ts():
-    """ Proxy per segmenti .TS con headers personalizzati """
+    """ Proxy per segmenti .TS con headers personalizzati e caching """
     ts_url = request.args.get('url', '').strip()
     if not ts_url:
         return "Errore: Parametro 'url' mancante", 400
@@ -312,10 +338,17 @@ def proxy_ts():
         if key.lower().startswith("h_")
     }
 
+    # --- CACHE: controlla se il segmento è già in cache ---
+    cached_data = get_from_cache(ts_cache, ts_url)
+    if cached_data:
+        return Response(cached_data, content_type="video/mp2t")
+
     try:
         response = requests.get(ts_url, headers=headers, stream=True, allow_redirects=True)
         response.raise_for_status()
-        return Response(response.iter_content(chunk_size=1024), content_type="video/mp2t")
+        data = response.content
+        set_in_cache(ts_cache, ts_url, data)
+        return Response(data, content_type="video/mp2t")
     
     except requests.RequestException as e:
         return f"Errore durante il download del segmento TS: {str(e)}", 500
@@ -341,5 +374,11 @@ def proxy_key():
     except requests.RequestException as e:
         return f"Errore durante il download della chiave AES-128: {str(e)}", 500
 
+@app.route('/')
+def index():
+    """Pagina principale che mostra un messaggio di benvenuto"""
+    return "Proxy started!"
+
 if __name__ == '__main__':
+    print("Proxy started!")
     app.run(host="0.0.0.0", port=7860, debug=False)
