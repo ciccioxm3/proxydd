@@ -1,6 +1,6 @@
 from flask import Flask, request, Response
 import requests
-from urllib.parse import urlparse, urljoin, quote, unquote
+from urllib.parse import urlparse, urljoin, quote, unquote, quote_plus
 import re
 import json
 import os
