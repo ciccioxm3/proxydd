@@ -17,9 +17,9 @@ app = Flask(__name__)
 # Cache per le playlist M3U8. TTL di 5 secondi per garantire l'aggiornamento dei live stream.
 M3U8_CACHE = TTLCache(maxsize=200, ttl=5)
 # Cache per i segmenti TS. LRU (Least Recently Used) per mantenere i segmenti più richiesti.
-TS_CACHE = LRUCache(maxsize=1000)  # Mantiene in memoria i 1000 segmenti usati più di recente
+TS_CACHE = LRUCache(maxsize=1000)
 # Cache per le chiavi di decriptazione.
-# RIMOSSO: KEY_CACHE non più utilizzata per proxying chiavi AES
+KEY_CACHE = TTLCache(maxsize=200, ttl=60) # TTL di 60 secondi per le chiavi
 # --- Configurazione Proxy ---
 # I proxy possono essere in formato http, https, socks5, socks5h. Es: 'socks5://user:pass@host:port'
 # È possibile specificare una lista di proxy separati da virgola. Verrà scelto uno a caso.
@@ -444,7 +444,22 @@ def proxy_m3u():
         modified_m3u8 = []
         for line in m3u_content.splitlines():
             line = line.strip()
-            if line and not line.startswith("#"): # This condition now handles only TS segments
+            if line.startswith("#EXT-X-KEY:"):
+                # Regex to find the URI attribute, handling quotes
+                uri_match = re.search(r'URI="([^"]+)"', line)
+                if uri_match:
+                    key_uri = uri_match.group(1)
+                    # Make the key URI absolute
+                    absolute_key_uri = urljoin(base_url, key_uri)
+                    # Create the proxied key URL
+                    proxied_key_url = f"/proxy/key?url={quote(absolute_key_uri)}&{headers_query}"
+                    # Replace the original URI with the proxied one
+                    modified_line = line.replace(key_uri, proxied_key_url)
+                    modified_m3u8.append(modified_line)
+                else:
+                    # If URI is not found, append the line as is
+                    modified_m3u8.append(line)
+            elif line and not line.startswith("#"):
                 segment_url = urljoin(base_url, line)
                 line = f"/proxy/ts?url={quote(segment_url)}&{headers_query}"
             modified_m3u8.append(line)
@@ -460,6 +475,45 @@ def proxy_m3u():
         return f"Errore durante il download o la risoluzione del file: {str(e)}", 500
     except Exception as e:
         return f"Errore generico nella funzione proxy_m3u: {str(e)}", 500
+
+@app.route('/proxy/key')
+def proxy_key():
+    """Proxy per chiavi di decrittazione AES con caching e headers."""
+    key_url = request.args.get('url', '').strip()
+    if not key_url:
+        return "Errore: Parametro 'url' per la chiave mancante", 400
+
+    # Crea una chiave di cache basata sull'URL della chiave
+    cache_key = key_url
+
+    if cache_key in KEY_CACHE:
+        app.logger.info(f"Cache HIT per KEY: {key_url}")
+        return Response(KEY_CACHE[cache_key], content_type="application/octet-stream")
+
+    app.logger.info(f"Cache MISS per KEY: {key_url}")
+
+    headers = {
+        unquote(key[2:]).replace("_", "-"): unquote(value).strip()
+        for key, value in request.args.items()
+        if key.lower().startswith("h_")
+    }
+
+    proxy_config = get_proxy_config_for_url(key_url)
+    if proxy_config['proxies']:
+        app.logger.debug(f"Proxy in uso per la chiave {key_url}")
+
+    try:
+        response = requests.get(key_url, headers=headers, proxies=proxy_config['proxies'], timeout=(10, 20), verify=proxy_config['verify'])
+        response.raise_for_status()
+        
+        key_content = response.content
+        
+        if key_content:
+            KEY_CACHE[cache_key] = key_content
+        
+        return Response(key_content, content_type="application/octet-stream")
+    except requests.RequestException as e:
+        return f"Errore durante il download della chiave: {str(e)}", 500
 
 @app.route('/proxy/ts')
 def proxy_ts():
