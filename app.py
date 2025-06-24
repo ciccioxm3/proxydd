@@ -1,11 +1,11 @@
 from flask import Flask, request, Response
 import requests
-from urllib.parse import urlparse, urljoin, quote, unquote, quote_plus
+from urllib.parse import urlparse, urljoin, quote, unquote
 import re
 import json
+import base64
 import os
 import random
-import base64
 from dotenv import load_dotenv
 from cachetools import TTLCache, LRUCache
 
@@ -19,23 +19,12 @@ M3U8_CACHE = TTLCache(maxsize=200, ttl=5)
 # Cache per i segmenti TS. LRU (Least Recently Used) per mantenere i segmenti più richiesti.
 TS_CACHE = LRUCache(maxsize=1000)  # Mantiene in memoria i 1000 segmenti usati più di recente
 # Cache per le chiavi di decriptazione.
-KEY_CACHE = LRUCache(maxsize=200)
+# RIMOSSO: KEY_CACHE non più utilizzata per proxying chiavi AES
 # --- Configurazione Proxy ---
 # I proxy possono essere in formato http, https, socks5, socks5h. Es: 'socks5://user:pass@host:port'
 # È possibile specificare una lista di proxy separati da virgola. Verrà scelto uno a caso.
 NEWKSO_PROXY = os.getenv('NEWKSO_PROXY', None)
 NEWKSO_SSL_VERIFY = os.getenv('NEWKSO_SSL_VERIFY', 'false').lower() == 'true'
-
-VAVOO_PROXY = os.getenv('VAVOO_PROXY', None)
-VAVOO_SSL_VERIFY = os.getenv('VAVOO_SSL_VERIFY', 'false').lower() == 'true'
-
-GENERAL_PROXY = os.getenv('GENERAL_PROXY', None)
-GENERAL_SSL_VERIFY = os.getenv('GENERAL_SSL_VERIFY', 'false').lower() == 'true'
-
-# Disabilita gli avvisi di richiesta non sicura se la verifica SSL è disattivata per QUALSIASI proxy
-if not all([NEWKSO_SSL_VERIFY, VAVOO_SSL_VERIFY, GENERAL_SSL_VERIFY]):
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Fetch Daddylive base URL at startup
 DADDY_LIVE_BASE_URL = None
@@ -51,23 +40,16 @@ except requests.RequestException as e:
 # Regex for Daddylive.sx stream URLs (e.g., https://daddylive.sx/stream/stream-ID.php)
 DADDY_LIVE_STREAM_PHP_PATTERN = re.compile(r"https?://(?:www\.)?daddylive\.sx/stream/stream-(\d+)\.php")
 
+VAVOO_PROXY = os.getenv('VAVOO_PROXY', None)
+VAVOO_SSL_VERIFY = os.getenv('VAVOO_SSL_VERIFY', 'false').lower() == 'true'
+GENERAL_PROXY = os.getenv('GENERAL_PROXY', None)
+GENERAL_SSL_VERIFY = os.getenv('GENERAL_SSL_VERIFY', 'false').lower() == 'true'
 
-DADDY_PHP_DOMAINS_MATCH = [
-    "new.newkso.ru/wind/",
-    "new.newkso.ru/ddy6/",
-    "new.newkso.ru/zeko/",
-    "new.newkso.ru/nfs/",
-    "new.newkso.ru/dokko1/",
-]
-
-DADDY_PHP_SITES_URLS = [
-    "https://new.newkso.ru/wind/",
-    "https://new.newkso.ru/ddy6/",
-    "https://new.newkso.ru/zeko/",
-    "https://new.newkso.ru/nfs/",
-    "https://new.newkso.ru/dokko1/",
-]
-
+# Disabilita gli avvisi di richiesta non sicura se la verifica SSL è disattivata per QUALSIASI proxy
+if not all([NEWKSO_SSL_VERIFY, VAVOO_SSL_VERIFY, GENERAL_SSL_VERIFY]):
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
 DADDY_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
 
 def _get_proxy_dict(proxy_env_var):
@@ -87,8 +69,8 @@ def get_proxy_config_for_url(url):
     lower_url = url.lower()
     parsed_url = urlparse(lower_url)
 
-    # 1. newkso.ru e daddy_php_sites
-    is_newkso = "newkso.ru" in parsed_url.netloc or any(domain in lower_url for domain in DADDY_PHP_DOMAINS_MATCH)
+    # 1. newkso.ru (per i domini specifici di newkso)
+    is_newkso = "newkso.ru" in parsed_url.netloc
     if is_newkso and NEWKSO_PROXY:
         return {"proxies": _get_proxy_dict(NEWKSO_PROXY), "verify": NEWKSO_SSL_VERIFY}
 
@@ -104,29 +86,10 @@ def get_proxy_config_for_url(url):
     return {"proxies": None, "verify": True}
 
 def detect_m3u_type(content):
-    """Rileva se è un M3U (lista IPTV) o un M3U8 (flusso HLS)"""
+    """Rileva se è un M3U (lista IPTV) o un M3U8 (flusso HLS)."""
     if "#EXTM3U" in content and "#EXTINF" in content:
         return "m3u8"
     return "m3u"
-
-def replace_key_uri(line, headers_query):
-    """Sostituisce l'URI della chiave AES-128 con il proxy"""
-    match = re.search(r'URI="([^"]+)"', line)
-    if match:
-        key_url = match.group(1)
-        proxied_key_url = f"/proxy/key?url={quote(key_url)}&{headers_query}"
-        return line.replace(key_url, proxied_key_url)
-    return line
-
-def resolve_m3u8_link(url, headers=None):
-    """
-    Risolve un URL M3U8 supportando header e proxy per newkso.ru e daddy_php_sites.
-    """
-    if not url:
-        app.logger.error("URL non fornito.")
-        return {"resolved_url": None, "headers": {}}
-
-    app.logger.info(f"Tentativo di risoluzione URL: {url}")
 
 def extract_daddylive_stream(initial_daddylive_url, client_headers):
     """
@@ -146,7 +109,7 @@ def extract_daddylive_stream(initial_daddylive_url, client_headers):
         html_content = response.text
 
         # Step 2: Extract and request "Player 2" link
-        player_2_match = re.search(r'<a[^>]*href="([^"]+)"[^>]*>\s*<button[^>]*>\s*Player\s*2\s*</button>', html_content)
+        player_2_match = re.search(r'<a[^>]*href="([^"]+)"[^>]*>\s*<button[^>]*>\s*Player\s*2\s*<\/button>', html_content)
         if not player_2_match:
             app.logger.error("Daddylive: No 'Player 2' link found.")
             raise ValueError("No 'Player 2' link found.")
@@ -184,8 +147,7 @@ def extract_daddylive_stream(initial_daddylive_url, client_headers):
         html_content = response.text
 
         # Step 4: Extract dynamic parameters (channelKey, auth_ts, auth_rnd, auth_sig, auth_host, auth_php, host, server_lookup)
-        # Using re.search().group(1) for robustness instead of re.findall(...)[0]
-        channel_key = re.search(r'(?s) channelKey = "([^"]*)"', html_content).group(1)
+        channel_key = re.search(r'(?s) channelKey = \"([^"]*)"', html_content).group(1)
         auth_ts = base64.b64decode(re.search(r'(?s)c = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
         auth_rnd = base64.b64decode(re.search(r'(?s)d = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
         auth_sig = base64.b64decode(re.search(r'(?s)e = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
@@ -226,12 +188,22 @@ def extract_daddylive_stream(initial_daddylive_url, client_headers):
         app.logger.info(f"Daddylive: Successfully extracted M3U8 URL: {final_m3u8_url}")
         return {"resolved_url": final_m3u8_url, "headers": final_headers}
 
-    except (requests.RequestException, ValueError, KeyError) as e:
+    except (requests.RequestException, ValueError, KeyError, AttributeError) as e:
         app.logger.error(f"Daddylive extraction failed for {initial_daddylive_url}: {e}", exc_info=True)
-        raise
+        return {"resolved_url": None, "headers": {}} # Return None for resolved_url on failure
     except Exception as e:
         app.logger.error(f"Daddylive unexpected extraction error for {initial_daddylive_url}: {e}", exc_info=True)
-        raise
+        return {"resolved_url": None, "headers": {}} # Return None for resolved_url on failure
+
+def resolve_m3u8_link(url, headers=None):
+    """
+    Risolve un URL M3U8 supportando header e proxy per newkso.ru e daddy_php_sites.
+    """
+    if not url:
+        app.logger.error("URL non fornito.")
+        return {"resolved_url": None, "headers": {}}
+
+    app.logger.info(f"Tentativo di risoluzione URL: {url}")
 
     # Inizializza gli header di default
     current_headers = headers if headers else {
@@ -266,53 +238,10 @@ def extract_daddylive_stream(initial_daddylive_url, client_headers):
     else:
         app.logger.info("URL pulito rilevato - Nessuna estrazione header necessaria")
 
-    # Gestione .php Daddy
-    if clean_url.endswith('.php'):
-        app.logger.info(f"Rilevato URL .php {clean_url}")
-        channel_id_match = re.search(r'stream-(\d+)\.php', clean_url)
-        if channel_id_match:
-            channel_id = channel_id_match.group(1)
-            app.logger.info(f"Channel ID estratto: {channel_id}")
-
-            newkso_headers_for_php_resolution = {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
-                'Referer': 'https://forcedtoplay.xyz/',
-                'Origin': 'https://forcedtoplay.xyz/'
-            }
-
-            # Tennis Channels
-            if channel_id.startswith("15") and len(channel_id) == 4:
-                tennis_suffix = channel_id[2:]
-                folder_name = f"wikiten{tennis_suffix}"
-                test_url = f"https://new.newkso.ru/wikihz/{folder_name}/mono.m3u8"
-                app.logger.info(f"Tentativo canale Tennis: {test_url}")
-                try:
-                    proxy_config = get_proxy_config_for_url(test_url)
-                    response = requests.head(test_url, headers=newkso_headers_for_php_resolution, 
-                                           proxies=proxy_config['proxies'], timeout=5, allow_redirects=True,
-                                           verify=proxy_config['verify'])
-                    if response.status_code == 200:
-                        app.logger.info(f"Stream Tennis trovato: {test_url}")
-                        return {"resolved_url": test_url, "headers": newkso_headers_for_php_resolution}
-                except requests.RequestException as e:
-                    app.logger.warning(f"Errore HEAD per Tennis stream {test_url}: {e}")
-            
-            # Daddy Channels
-            else:
-                folder_name = f"premium{channel_id}"
-                for site in DADDY_PHP_SITES_URLS:
-                    test_url = f"{site}{folder_name}/mono.m3u8"
-                    app.logger.info(f"Tentativo canale Daddy: {test_url}")
-                    try:
-                        proxy_config = get_proxy_config_for_url(test_url)
-                        response = requests.head(test_url, headers=newkso_headers_for_php_resolution, 
-                                               proxies=proxy_config['proxies'], timeout=5, allow_redirects=True,
-                                               verify=proxy_config['verify'])
-                        if response.status_code == 200:
-                            app.logger.info(f"Stream Daddy trovato: {test_url}")
-                            return {"resolved_url": test_url, "headers": newkso_headers_for_php_resolution}
-                    except requests.RequestException as e:
-                        app.logger.warning(f"Errore HEAD per Daddy stream {test_url}: {e}")
+    # Check if it's a Daddylive.sx stream.php URL and use the specific extractor
+    if DADDY_LIVE_STREAM_PHP_PATTERN.match(clean_url):
+        app.logger.info(f"Detected Daddylive.sx stream.php URL: {clean_url}. Using specific extractor.")
+        return extract_daddylive_stream(clean_url, current_headers)
 
     # Fallback: richiesta normale
     try:
@@ -575,44 +504,6 @@ def proxy_ts():
     except requests.RequestException as e:
         return f"Errore durante il download del segmento TS: {str(e)}", 500
 
-@app.route('/proxy/key')
-def proxy_key():
-    """Proxy per la chiave AES-128 con caching, header personalizzati e supporto proxy."""
-    key_url = request.args.get('url', '').strip()
-    if not key_url:
-        return "Errore: Parametro 'url' mancante per la chiave", 400
-
-    # Controlla se la chiave è in cache
-    if key_url in KEY_CACHE:
-        app.logger.info(f"Cache HIT per KEY: {key_url}")
-        return Response(KEY_CACHE[key_url], content_type="application/octet-stream")
-
-    app.logger.info(f"Cache MISS per KEY: {key_url}")
-
-    headers = {
-        unquote(key[2:]).replace("_", "-"): unquote(value).strip()
-        for key, value in request.args.items()
-        if key.lower().startswith("h_")
-    }
-
-    proxy_config = get_proxy_config_for_url(key_url)
-    if proxy_config['proxies']:
-        app.logger.debug(f"Proxy in uso per {key_url}")
-
-    try:
-        response = requests.get(key_url, headers=headers, proxies=proxy_config['proxies'], 
-                              allow_redirects=True, timeout=(10, 20), verify=proxy_config['verify'])
-        response.raise_for_status()
-        
-        key_content = response.content
-        
-        # Salva la chiave nella cache
-        KEY_CACHE[key_url] = key_content
-        
-        return Response(key_content, content_type="application/octet-stream")
-    
-    except requests.RequestException as e:
-        return f"Errore durante il download della chiave: {str(e)}", 500
 @app.route('/proxyd')
 def proxyd():
     """
@@ -630,6 +521,10 @@ def proxyd():
         extracted_info = extract_daddylive_stream(daddylive_url, request.headers)
         final_m3u8_url = extracted_info["resolved_url"]
         final_headers = extracted_info["headers"]
+
+        if not final_m3u8_url:
+            app.logger.error(f"Daddylive extraction returned no URL for {daddylive_url}")
+            return "Errore: Impossibile estrarre il link Daddylive.", 500
 
         # Redirect to /proxy/m3u with the extracted URL and headers
         headers_query_string = "&".join([f"h_{quote(k)}={quote(v)}" for k, v in final_headers.items()])
