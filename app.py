@@ -1,6 +1,6 @@
 from flask import Flask, request, Response
 import requests
-from urllib.parse import urlparse, urljoin, quote, unquote, quote_plus
+from urllib.parse import urlparse, urljoin, quote, unquote
 import re
 import json
 import base64
@@ -444,9 +444,7 @@ def proxy_m3u():
         modified_m3u8 = []
         for line in m3u_content.splitlines():
             line = line.strip()
-            if line.startswith("#EXT-X-KEY") and 'URI="' in line:
-                line = replace_key_uri(line, headers_query)
-            elif line and not line.startswith("#"):
+            if line and not line.startswith("#"): # This condition now handles only TS segments
                 segment_url = urljoin(base_url, line)
                 line = f"/proxy/ts?url={quote(segment_url)}&{headers_query}"
             modified_m3u8.append(line)
