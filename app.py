@@ -5,6 +5,7 @@ import re
 import json
 import os
 import random
+import base64
 from dotenv import load_dotenv
 from cachetools import TTLCache, LRUCache
 
