@@ -1,534 +1,514 @@
 from flask import Flask, request, Response
 import requests
-from urllib.parse import urlparse, urljoin, quote, unquote, quote_plus
+from urllib.parse import urlparse, urljoin, quote, unquote
 import re
-import json
+import traceback
+import time
+from threading import Lock
+import gc
+from collections import OrderedDict
 import base64
-import os
-import random
-from dotenv import load_dotenv
-from cachetools import TTLCache, LRUCache
-
-load_dotenv()  # Carica le variabili dal file .env
+from urllib.parse import quote_plus
 
 app = Flask(__name__)
 
-# --- Configurazione Cache ---
-# Cache per le playlist M3U8. TTL di 5 secondi per garantire l'aggiornamento dei live stream.
-M3U8_CACHE = TTLCache(maxsize=200, ttl=5)
-# Cache per i segmenti TS. LRU (Least Recently Used) per mantenere i segmenti più richiesti.
-TS_CACHE = LRUCache(maxsize=1000)
-# Cache per le chiavi di decriptazione.
-KEY_CACHE = TTLCache(maxsize=200, ttl=60) # TTL di 60 secondi per le chiavi
-# --- Configurazione Proxy ---
-# I proxy possono essere in formato http, https, socks5, socks5h. Es: 'socks5://user:pass@host:port'
-# È possibile specificare una lista di proxy separati da virgola. Verrà scelto uno a caso.
-NEWKSO_PROXY = os.getenv('NEWKSO_PROXY', None)
-NEWKSO_SSL_VERIFY = os.getenv('NEWKSO_SSL_VERIFY', 'false').lower() == 'true'
+# --- CONFIGURAZIONE CACHE OTTIMIZZATA ---
+CACHE_TTL = 30  # Ridotto da 60 a 30 secondi
+MAX_CACHE_SIZE = 50  # Limite massimo di elementi in cache
+MAX_TS_SIZE = 5 * 1024 * 1024  # Massimo 5MB per segmento TS
+MAX_TOTAL_CACHE_SIZE = 100 * 1024 * 1024  # Massimo 100MB totali in cache
 
-# Fetch Daddylive base URL at startup
-DADDY_LIVE_BASE_URL = None
-try:
-    main_url_response = requests.get('https://raw.githubusercontent.com/thecrewwh/dl_url/refs/heads/main/dl.xml', timeout=5)
-    main_url_response.raise_for_status()
-    DADDY_LIVE_BASE_URL = re.findall('src = "([^"]*)', main_url_response.text)[0]
-    app.logger.info(f"DADDY_LIVE_BASE_URL fetched: {DADDY_LIVE_BASE_URL}")
-except requests.RequestException as e:
-    app.logger.error(f"Failed to fetch DADDY_LIVE_BASE_URL: {e}")
-    DADDY_LIVE_BASE_URL = "https://daddylive.sx/" # Fallback to a common Daddylive domain if fetching fails
+# Cache LRU (Least Recently Used) ottimizzate
+class LRUCache:
+    def __init__(self, max_size, max_item_size=None):
+        self.max_size = max_size
+        self.max_item_size = max_item_size
+        self.cache = OrderedDict()
+        self.lock = Lock()
+        self.current_size = 0  # Traccia la dimensione totale in byte
 
-# Regex for Daddylive.sx stream URLs (e.g., https://daddylive.sx/stream/stream-ID.php)
-DADDY_LIVE_STREAM_PHP_PATTERN = re.compile(r"https?://(?:www\.)?daddylive\.sx/stream/stream-(\d+)\.php")
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                timestamp, value = self.cache[key]
+                if time.time() - timestamp < CACHE_TTL:
+                    # Sposta alla fine (most recently used)
+                    self.cache.move_to_end(key)
+                    return value
+                else:
+                    # Rimuovi elemento scaduto
+                    self._remove_item(key)
+            return None
 
-VAVOO_PROXY = os.getenv('VAVOO_PROXY', None)
-VAVOO_SSL_VERIFY = os.getenv('VAVOO_SSL_VERIFY', 'false').lower() == 'true'
-GENERAL_PROXY = os.getenv('GENERAL_PROXY', None)
-GENERAL_SSL_VERIFY = os.getenv('GENERAL_SSL_VERIFY', 'false').lower() == 'true'
+    def put(self, key, value):
+        with self.lock:
+            # Controlla dimensione dell'elemento
+            value_size = len(value) if isinstance(value, (bytes, str)) else 0
+            if self.max_item_size and value_size > self.max_item_size:
+                return  # Non cachare elementi troppo grandi
 
-# Disabilita gli avvisi di richiesta non sicura se la verifica SSL è disattivata per QUALSIASI proxy
-if not all([NEWKSO_SSL_VERIFY, VAVOO_SSL_VERIFY, GENERAL_SSL_VERIFY]):
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
-DADDY_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+            # Rimuovi elemento esistente se presente
+            if key in self.cache:
+                self._remove_item(key)
 
-def _get_proxy_dict(proxy_env_var):
-    """Helper per creare un dizionario di proxy da una variabile d'ambiente."""
-    if not proxy_env_var:
-        return None
-    proxy_list = [p.strip() for p in proxy_env_var.split(',')]
-    selected_proxy = random.choice(proxy_list)
-    # la libreria requests gestisce lo schema (http, https, socks5, socks5h) dall'URL del proxy
-    return {'http': selected_proxy, 'https': selected_proxy}
+            # Assicurati che ci sia spazio
+            while len(self.cache) >= self.max_size or self.current_size + value_size > MAX_TOTAL_CACHE_SIZE:
+                if not self.cache:
+                    break
+                self._remove_oldest()
 
-def get_proxy_config_for_url(url):
-    """
-    Restituisce la configurazione del proxy (dizionario proxy e flag di verifica SSL) per un dato URL.
-    Supporta proxy specifici per dominio (newkso, vavoo) e un proxy generale.
-    """
-    lower_url = url.lower()
-    parsed_url = urlparse(lower_url)
+            # Aggiungi nuovo elemento
+            self.cache[key] = (time.time(), value)
+            self.current_size += value_size
 
-    # 1. newkso.ru (per i domini specifici di newkso)
-    is_newkso = "newkso.ru" in parsed_url.netloc
-    if is_newkso and NEWKSO_PROXY:
-        return {"proxies": _get_proxy_dict(NEWKSO_PROXY), "verify": NEWKSO_SSL_VERIFY}
+    def _remove_item(self, key):
+        if key in self.cache:
+            _, value = self.cache[key]
+            value_size = len(value) if isinstance(value, (bytes, str)) else 0
+            self.current_size -= value_size
+            del self.cache[key]
 
-    # 2. vavoo.to
-    if "vavoo.to" in parsed_url.netloc and VAVOO_PROXY:
-        return {"proxies": _get_proxy_dict(VAVOO_PROXY), "verify": VAVOO_SSL_VERIFY}
+    def _remove_oldest(self):
+        if self.cache:
+            oldest_key = next(iter(self.cache))
+            self._remove_item(oldest_key)
 
-    # 3. Proxy Generale (se non corrisponde a domini specifici)
-    if GENERAL_PROXY:
-        return {"proxies": _get_proxy_dict(GENERAL_PROXY), "verify": GENERAL_SSL_VERIFY}
+    def cleanup_expired(self):
+        """Rimuove elementi scaduti"""
+        with self.lock:
+            current_time = time.time()
+            expired_keys = [
+                key for key, (timestamp, _) in self.cache.items()
+                if current_time - timestamp >= CACHE_TTL
+            ]
+            for key in expired_keys:
+                self._remove_item(key)
 
-    # 4. Nessun proxy
-    return {"proxies": None, "verify": True}
+    def clear(self):
+        """Svuota completamente la cache"""
+        with self.lock:
+            self.cache.clear()
+            self.current_size = 0
+
+# Inizializza cache ottimizzate
+ts_cache = LRUCache(MAX_CACHE_SIZE, MAX_TS_SIZE)
+key_cache = LRUCache(MAX_CACHE_SIZE // 2)  # Cache più piccola per le chiavi
+
+# Timer per pulizia periodica
+last_cleanup = time.time()
+CLEANUP_INTERVAL = 60  # Pulizia ogni 60 secondi
+
+def periodic_cleanup():
+    """Pulizia periodica delle cache"""
+    global last_cleanup
+    current_time = time.time()
+    if current_time - last_cleanup > CLEANUP_INTERVAL:
+        ts_cache.cleanup_expired()
+        key_cache.cleanup_expired()
+        gc.collect()  # Forza garbage collection
+        last_cleanup = current_time
 
 def detect_m3u_type(content):
-    """Rileva se è un M3U (lista IPTV) o un M3U8 (flusso HLS)."""
+    """Rileva se è un M3U (lista IPTV) o un M3U8 (flusso HLS)"""
     if "#EXTM3U" in content and "#EXTINF" in content:
         return "m3u8"
     return "m3u"
 
-def extract_daddylive_stream(initial_daddylive_url, client_headers):
-    """
-    Extracts the final M3U8 stream URL and headers from a Daddylive.sx stream.php URL.
-    Emulates the logic from plugin.video.daddylive/addon.py.
-    """
-    app.logger.info(f"Starting Daddylive stream extraction for: {initial_daddylive_url}")
+def replace_key_uri(line, headers_query):
+    """Sostituisce l'URI della chiave AES-128 con il proxy"""
+    match = re.search(r'URI="([^"]+)"', line)
+    if match:
+        key_url = match.group(1)
+        proxied_key_url = f"/proxy/key?url={quote(key_url)}&{headers_query}"
+        return line.replace(key_url, proxied_key_url)
+    return line
 
-    try:
-        # Step 1: Request to initial stream.php page
-        headers = {'User-Agent': DADDY_UA, 'Referer': DADDY_LIVE_BASE_URL, 'Origin': DADDY_LIVE_BASE_URL}
-        
-        proxy_config = get_proxy_config_for_url(initial_daddylive_url)
-        response = requests.get(initial_daddylive_url, headers=headers, timeout=10,
-                                proxies=proxy_config['proxies'], verify=proxy_config['verify'])
-        response.raise_for_status()
-        html_content = response.text
+def extract_channel_id(url):
+    """Estrae l'ID del canale da vari formati URL"""
 
-        # Step 2: Extract and request "Player 2" link
-        player_2_match = re.search(r'<a[^>]*href="([^"]+)"[^>]*>\s*<button[^>]*>\s*Player\s*2\s*<\/button>', html_content)
-        if not player_2_match:
-            app.logger.error("Daddylive: No 'Player 2' link found.")
-            raise ValueError("No 'Player 2' link found.")
+    # Pattern per premium/mono.m3u8
+    match_premium = re.search(r'/premium(\d+)/mono\.m3u8$', url)
+    if match_premium:
+        return match_premium.group(1)
 
-        url2_path = player_2_match.group(1)
-        url2 = urljoin(DADDY_LIVE_BASE_URL, url2_path) # Use urljoin for robustness
-        url2 = url2.replace('//cast', '/cast') # Fix for potential double slash
+    # Pattern per watch/stream-ID.php
+    match_watch = re.search(r'/watch/stream-(\d+)\.php$', url)
+    if match_watch:
+        return match_watch.group(1)
 
-        headers['Referer'] = url2
-        headers['Origin'] = url2 # Origin should be the same as Referer for this step
-        
-        proxy_config = get_proxy_config_for_url(url2)
-        response = requests.get(url2, headers=headers, timeout=10,
-                                proxies=proxy_config['proxies'], verify=proxy_config['verify'])
-        response.raise_for_status()
-        html_content = response.text
+    # Pattern per stream/stream-ID.php
+    match_stream = re.search(r'/stream/stream-(\d+)\.php$', url)
+    if match_stream:
+        return match_stream.group(1)
 
-        # Step 3: Extract and request main iframe URL
-        iframe_match = re.search(r'iframe src="([^"]*)"', html_content)
-        if not iframe_match:
-            app.logger.error("Daddylive: No iframe src found in Player 2 page.")
-            raise ValueError("No iframe src found.")
-        
-        iframe_url = iframe_match.group(1)
-        # The iframe_url might be relative or absolute. Use urljoin with url2 as base.
-        iframe_url = urljoin(url2, iframe_url)
+    # Estrai da URL generici contenenti numeri
+    match_generic = re.search(r'(\d+)', url)
+    if match_generic:
+        return match_generic.group(1)
 
-        headers['Referer'] = iframe_url # Referer for the iframe page
-        headers['Origin'] = urlparse(iframe_url).scheme + "://" + urlparse(iframe_url).netloc # Origin for the iframe page
-        
-        proxy_config = get_proxy_config_for_url(iframe_url)
-        response = requests.get(iframe_url, headers=headers, timeout=10,
-                                proxies=proxy_config['proxies'], verify=proxy_config['verify'])
-        response.raise_for_status()
-        html_content = response.text
+    return None
 
-        # Step 4: Extract dynamic parameters (channelKey, auth_ts, auth_rnd, auth_sig, auth_host, auth_php, host, server_lookup)
-        channel_key = re.search(r'(?s) channelKey = \"([^"]*)"', html_content).group(1)
-        auth_ts = base64.b64decode(re.search(r'(?s)c = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
-        auth_rnd = base64.b64decode(re.search(r'(?s)d = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
-        auth_sig = base64.b64decode(re.search(r'(?s)e = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
-        auth_host = base64.b64decode(re.search(r'(?s)a = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
-        auth_php = base64.b64decode(re.search(r'(?s)b = atob\("([^"]*)"\)', html_content).group(1)).decode('utf-8')
-        host = re.search(r'(?s)m3u8 =.*?:.*?:.*?".*?".*?"([^"]*)"', html_content).group(1)
-        server_lookup = re.search(r"n fetchWithRetry\(\s*'([^']*)'", html_content).group(1)
+def process_daddylive_url(url):
+    """Converte URL vecchi in formati compatibili con DaddyLive 2025"""
 
-        # Step 5: Request authentication URL
-        auth_sig_quoted = quote_plus(auth_sig)
-        auth_url = f'{auth_host}{auth_php}?channel_id={channel_key}&ts={auth_ts}&rnd={auth_rnd}&sig={auth_sig_quoted}'
-        
-        proxy_config = get_proxy_config_for_url(auth_url)
-        requests.get(auth_url, headers=headers, timeout=10,
-                     proxies=proxy_config['proxies'], verify=proxy_config['verify'])
+    # Converti premium URLs in formato watch
+    match_premium = re.search(r'/premium(\d+)/mono\.m3u8$', url)
+    if match_premium:
+        channel_id = match_premium.group(1)
+        new_url = f"https://daddylive.mp/watch/stream-{channel_id}.php"
+        print(f"URL processato da {url} a {new_url}")
+        return new_url
 
-        # Step 6: Request server key
-        server_lookup_url = f"https://{urlparse(iframe_url).netloc}{server_lookup}{channel_key}"
-        
-        proxy_config = get_proxy_config_for_url(server_lookup_url)
-        response = requests.get(server_lookup_url, headers=headers, timeout=10,
-                                proxies=proxy_config['proxies'], verify=proxy_config['verify'])
-        response.raise_for_status()
-        server_key = response.json()['server_key']
+    # Se è già un URL DaddyLive moderno, usalo direttamente
+    if 'daddylive.mp' in url and ('watch/' in url or 'stream/' in url):
+        return url
 
-        # Step 7: Construct final M3U8 link
-        final_m3u8_url = f'https://{server_key}{host}{server_key}/{channel_key}/mono.m3u8'
+    # Se contiene solo numeri, crea URL watch
+    if url.isdigit():
+        return f"https://daddylive.mp/watch/stream-{url}.php"
 
-        # Construct final headers for the M3U8 stream
-        referer_raw = f'https://{urlparse(iframe_url).netloc}'
-        final_headers = {
-            'User-Agent': DADDY_UA,
-            'Referer': referer_raw + '/',
-            'Origin': referer_raw,
-            'Connection': 'Keep-Alive'
-        }
-        
-        app.logger.info(f"Daddylive: Successfully extracted M3U8 URL: {final_m3u8_url}")
-        return {"resolved_url": final_m3u8_url, "headers": final_headers}
-
-    except (requests.RequestException, ValueError, KeyError, AttributeError) as e:
-        app.logger.error(f"Daddylive extraction failed for {initial_daddylive_url}: {e}", exc_info=True)
-        return {"resolved_url": None, "headers": {}} # Return None for resolved_url on failure
-    except Exception as e:
-        app.logger.error(f"Daddylive unexpected extraction error for {initial_daddylive_url}: {e}", exc_info=True)
-        return {"resolved_url": None, "headers": {}} # Return None for resolved_url on failure
+    return url
 
 def resolve_m3u8_link(url, headers=None):
     """
-    Risolve un URL M3U8 supportando header e proxy per newkso.ru e daddy_php_sites.
+    Risolve URL DaddyLive usando il metodo esatto di addon.py PlayStream
     """
     if not url:
-        app.logger.error("URL non fornito.")
+        print("Errore: URL non fornito.")
         return {"resolved_url": None, "headers": {}}
 
-    app.logger.info(f"Tentativo di risoluzione URL: {url}")
+    print(f"Tentativo di risoluzione URL: {url}")
 
-    # Inizializza gli header di default
+    # Header di default identici a addon.py
     current_headers = headers if headers else {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+        'Referer': 'https://daddylive.mp/',
+        'Origin': 'https://daddylive.mp'
     }
-    
-    clean_url = url
-    extracted_headers = {}
-
-    # Estrazione header da URL
-    if '&h_' in url or '%26h_' in url:
-        app.logger.info("Rilevati parametri header nell'URL - Estrazione in corso...")
-        if '%26h_' in url:
-            if 'vavoo.to' in url.lower():
-                url = url.replace('%26', '&')
-            else:
-                url = unquote(unquote(url))
-        url_parts = url.split('&h_', 1)
-        clean_url = url_parts[0]
-        header_params = '&h_' + url_parts[1]
-        for param in header_params.split('&'):
-            if param.startswith('h_'):
-                try:
-                    key_value = param[2:].split('=', 1)
-                    if len(key_value) == 2:
-                        key = unquote(key_value[0]).replace('_', '-')
-                        value = unquote(key_value[1])
-                        extracted_headers[key] = value
-                except Exception as e:
-                    app.logger.error(f"Errore nell'estrazione dell'header {param}: {e}")
-        current_headers.update(extracted_headers)
-    else:
-        app.logger.info("URL pulito rilevato - Nessuna estrazione header necessaria")
-
-    # Check if it's a Daddylive.sx stream.php URL and use the specific extractor
-    if DADDY_LIVE_STREAM_PHP_PATTERN.match(clean_url):
-        app.logger.info(f"Detected Daddylive.sx stream.php URL: {clean_url}. Using specific extractor.")
-        return extract_daddylive_stream(clean_url, current_headers)
-
-    # Fallback: richiesta normale
-    try:
-        with requests.Session() as session:
-            proxy_config = get_proxy_config_for_url(clean_url)
-            if proxy_config['proxies']:
-                app.logger.debug(f"Proxy in uso per {clean_url}")
-            app.logger.info(f"Passo 1: Richiesta a {clean_url}")
-            response = session.get(clean_url, headers=current_headers, proxies=proxy_config['proxies'], 
-                                 allow_redirects=True, timeout=(10, 20), verify=proxy_config['verify'])
-            response.raise_for_status()
-            initial_response_text = response.text
-            final_url_after_redirects = response.url
-            app.logger.info(f"Passo 1 completato. URL finale dopo redirect: {final_url_after_redirects}")
-
-            if initial_response_text and initial_response_text.strip().startswith('#EXTM3U'):
-                app.logger.info("Trovato file M3U8 diretto.")
-                return {
-                    "resolved_url": final_url_after_redirects,
-                    "headers": current_headers
-                }
-            else:
-                app.logger.info("La risposta iniziale non era un M3U8 diretto.")
-                return {
-                    "resolved_url": clean_url,
-                    "headers": current_headers
-                }
-
-    except requests.RequestException as e:
-        app.logger.error(f"Errore durante la richiesta HTTP iniziale: {e}")
-        return {"resolved_url": clean_url, "headers": current_headers}
-    except Exception as e:
-        app.logger.error(f"Errore generico durante la risoluzione: {e}")
-        return {"resolved_url": clean_url, "headers": current_headers}
-
-@app.route('/proxy')
-def proxy():
-    """Proxy per liste M3U che aggiunge automaticamente /proxy/m3u?url= con IP prima dei link"""
-    m3u_url = request.args.get('url', '').strip()
-    if not m3u_url:
-        return "Errore: Parametro 'url' mancante", 400
 
     try:
-        server_ip = request.host
-        response = requests.get(m3u_url, timeout=(10, 30))
+        # Ottieni URL base dinamico
+        print("Ottengo URL base dinamico...")
+        main_url = requests.get(
+            'https://raw.githubusercontent.com/thecrewwh/dl_url/refs/heads/main/dl.xml',
+            timeout=5
+        ).text
+        baseurl = re.findall('src = "([^"]*)', main_url)[0]
+        print(f"URL base ottenuto: {baseurl}")
+
+        # Estrai ID del canale dall'URL
+        channel_id = extract_channel_id(url)
+        if not channel_id:
+            print("Impossibile estrarre ID canale")
+            return {"resolved_url": url, "headers": current_headers}
+
+        print(f"ID canale estratto: {channel_id}")
+
+        # Costruisci URL del stream (identico a addon.py)
+        stream_url = f"{baseurl}stream/stream-{channel_id}.php"
+        print(f"URL stream costruito: {stream_url}")
+
+        # Aggiorna header con baseurl corretto
+        current_headers['Referer'] = baseurl + '/'
+        current_headers['Origin'] = baseurl
+
+        # PASSO 1: Richiesta alla pagina stream per cercare Player 2
+        print(f"Passo 1: Richiesta a {stream_url}")
+        response = requests.get(stream_url, headers=current_headers, timeout=10)
         response.raise_for_status()
-        m3u_content = response.text
-        
-        modified_lines = []
-        # This list will accumulate header parameters for the *next* stream URL
-        current_stream_headers_params = [] 
 
-        for line in m3u_content.splitlines():
-            line = line.strip()
-            if line.startswith('#EXTHTTP:'):
-                try:
-                    json_str = line.split(':', 1)[1].strip()
-                    headers_dict = json.loads(json_str)
-                    for key, value in headers_dict.items():
-                        encoded_key = quote(quote(key))
-                        encoded_value = quote(quote(str(value)))
-                        current_stream_headers_params.append(f"h_{encoded_key}={encoded_value}")
-                except Exception as e:
-                    app.logger.error(f"Errore nel parsing di #EXTHTTP '{line}': {e}")
-                modified_lines.append(line)
-            
-            elif line.startswith('#EXTVLCOPT:'):
-                try:
-                    options_str = line.split(':', 1)[1].strip()
-                    # Split by comma, then iterate through key=value pairs
-                    for opt_pair in options_str.split(','):
-                        opt_pair = opt_pair.strip()
-                        if '=' in opt_pair:
-                            key, value = opt_pair.split('=', 1)
-                            key = key.strip()
-                            value = value.strip().strip('"') # Remove potential quotes
-                            
-                            header_key = None
-                            if key.lower() == 'http-user-agent':
-                                header_key = 'User-Agent'
-                            elif key.lower() == 'http-referer':
-                                header_key = 'Referer'
-                            elif key.lower() == 'http-cookie':
-                                header_key = 'Cookie'
-                            elif key.lower() == 'http-header': # For generic http-header option
-                                # This handles cases like http-header=X-Custom: Value
-                                full_header_value = value
-                                if ':' in full_header_value:
-                                    header_name, header_val = full_header_value.split(':', 1)
-                                    header_key = header_name.strip()
-                                    value = header_val.strip()
-                                else:
-                                    app.logger.warning(f"Malformed http-header option in EXTVLCOPT: {opt_pair}")
-                                    continue # Skip malformed header
-                            
-                            if header_key:
-                                encoded_key = quote(quote(header_key))
-                                encoded_value = quote(quote(value))
-                                current_stream_headers_params.append(f"h_{encoded_key}={encoded_value}")
-                            
-                except Exception as e:
-                    app.logger.error(f"Errore nel parsing di #EXTVLCOPT '{line}': {e}")
-                modified_lines.append(line) # Keep the original EXTVLCOPT line in the output
-            elif line and not line.startswith('#'):
-                if 'pluto.tv' in line.lower():
-                    modified_lines.append(line)
-                else:
-                    encoded_line = quote(line, safe='')
-                    # Construct the headers query string from accumulated parameters
-                    headers_query_string = ""
-                    if current_stream_headers_params:
-                        headers_query_string = "%26" + "%26".join(current_stream_headers_params)
-                    
-                    modified_line = f"http://{server_ip}/proxy/m3u?url={encoded_line}{headers_query_string}"
-                    modified_lines.append(modified_line)
-                
-                # Reset headers for the next stream URL
-                current_stream_headers_params = [] 
-            else:
-                modified_lines.append(line)
-        
-        modified_content = '\n'.join(modified_lines)
-        parsed_m3u_url = urlparse(m3u_url)
-        original_filename = os.path.basename(parsed_m3u_url.path)
-        
-        return Response(modified_content, content_type="application/vnd.apple.mpegurl", headers={'Content-Disposition': f'attachment; filename="{original_filename}"'})
-        
-    except requests.RequestException as e:
-        return f"Errore durante il download della lista M3U: {str(e)}", 500
+        # Cerca link Player 2 (metodo esatto da addon.py)
+        iframes = re.findall(r'<a[^>]*href="([^"]+)"[^>]*>\s*<button[^>]*>\s*Player\s*2\s*<\/button>', response.text)
+        if not iframes:
+            print("Nessun link Player 2 trovato")
+            return {"resolved_url": url, "headers": current_headers}
+
+        print(f"Passo 2: Trovato link Player 2: {iframes[0]}")
+
+        # PASSO 2: Segui il link Player 2
+        url2 = iframes[0]
+        url2 = baseurl + url2
+        url2 = url2.replace('//cast', '/cast')  # Fix da addon.py
+
+        # Aggiorna header
+        current_headers['Referer'] = url2
+        current_headers['Origin'] = url2
+
+        print(f"Passo 3: Richiesta a Player 2: {url2}")
+        response = requests.get(url2, headers=current_headers, timeout=10)
+        response.raise_for_status()
+
+        # PASSO 3: Cerca iframe nella risposta Player 2
+        iframes = re.findall(r'iframe src="([^"]*)', response.text)
+        if not iframes:
+            print("Nessun iframe trovato nella pagina Player 2")
+            return {"resolved_url": url, "headers": current_headers}
+
+        iframe_url = iframes[0]
+        print(f"Passo 4: Trovato iframe: {iframe_url}")
+
+        # PASSO 4: Accedi all'iframe
+        print(f"Passo 5: Richiesta iframe: {iframe_url}")
+        response = requests.get(iframe_url, headers=current_headers, timeout=10)
+        response.raise_for_status()
+
+        iframe_content = response.text
+
+        # PASSO 5: Estrai parametri dall'iframe (metodo esatto addon.py)
+        try:
+            import base64
+            from urllib.parse import quote_plus
+
+            channel_key = re.findall(r'(?s) channelKey = \"([^"]*)', iframe_content)[0]
+
+            # Estrai e decodifica parametri base64
+            auth_ts_b64 = re.findall(r'(?s)c = atob\("([^"]*)', iframe_content)[0]
+            auth_ts = base64.b64decode(auth_ts_b64).decode('utf-8')
+
+            auth_rnd_b64 = re.findall(r'(?s)d = atob\("([^"]*)', iframe_content)[0]
+            auth_rnd = base64.b64decode(auth_rnd_b64).decode('utf-8')
+
+            auth_sig_b64 = re.findall(r'(?s)e = atob\("([^"]*)', iframe_content)[0]
+            auth_sig = base64.b64decode(auth_sig_b64).decode('utf-8')
+            auth_sig = quote_plus(auth_sig)
+
+            auth_host_b64 = re.findall(r'(?s)a = atob\("([^"]*)', iframe_content)[0]
+            auth_host = base64.b64decode(auth_host_b64).decode('utf-8')
+
+            auth_php_b64 = re.findall(r'(?s)b = atob\("([^"]*)', iframe_content)[0]
+            auth_php = base64.b64decode(auth_php_b64).decode('utf-8')
+
+            print(f"Parametri estratti: channel_key={channel_key}")
+
+        except (IndexError, Exception) as e:
+            print(f"Errore estrazione parametri: {e}")
+            return {"resolved_url": url, "headers": current_headers}
+
+        # PASSO 6: Richiesta di autenticazione
+        auth_url = f'{auth_host}{auth_php}?channel_id={channel_key}&ts={auth_ts}&rnd={auth_rnd}&sig={auth_sig}'
+        print(f"Passo 6: Autenticazione: {auth_url}")
+
+        auth_response = requests.get(auth_url, headers=current_headers, timeout=10)
+        auth_response.raise_for_status()
+
+        # PASSO 7: Estrai host e server lookup
+        host = re.findall('(?s)m3u8 =.*?:.*?:.*?".*?".*?"([^"]*)', iframe_content)[0]
+        server_lookup = re.findall('n fetchWithRetry\(\s*\'([^\']*)', iframe_content)[0]
+
+        # PASSO 8: Server lookup per ottenere server_key
+        server_lookup_url = f"https://{urlparse(iframe_url).netloc}{server_lookup}{channel_key}"
+        print(f"Passo 7: Server lookup: {server_lookup_url}")
+
+        lookup_response = requests.get(server_lookup_url, headers=current_headers, timeout=10)
+        lookup_response.raise_for_status()
+        server_data = lookup_response.json()
+        server_key = server_data['server_key']
+
+        print(f"Server key ottenuto: {server_key}")
+
+        # PASSO 9: Costruisci URL M3U8 finale SENZA parametri proxy
+        referer_raw = f'https://{urlparse(iframe_url).netloc}'
+
+        # URL base M3U8 PULITO (senza parametri proxy)
+        clean_m3u8_url = f'https://{server_key}{host}{server_key}/{channel_key}/mono.m3u8'
+
+        print(f"URL M3U8 pulito costruito: {clean_m3u8_url}")
+
+        # Header corretti per il fetch
+        final_headers = {
+            'User-Agent': current_headers.get('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'),
+            'Referer': referer_raw,
+            'Origin': referer_raw
+        }
+
+        return {
+            "resolved_url": clean_m3u8_url,  # URL PULITO senza parametri proxy
+            "headers": final_headers          # Header corretti
+        }
+
     except Exception as e:
-        return f"Errore generico: {str(e)}", 500
+        print(f"Errore durante la risoluzione: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return {"resolved_url": url, "headers": current_headers}
 
 @app.route('/proxy/m3u')
 def proxy_m3u():
-    """Proxy per file M3U e M3U8 con supporto per proxy e caching."""
+    """Proxy per file M3U e M3U8 con supporto DaddyLive 2025"""
+    periodic_cleanup()  # Pulizia periodica
+
     m3u_url = request.args.get('url', '').strip()
     if not m3u_url:
         return "Errore: Parametro 'url' mancante", 400
 
-    # Crea una chiave univoca per la cache basata sull'URL e sugli header specifici
-    # Questo assicura che richieste con header diversi non usino la stessa cache
-    cache_key_headers = "&".join(sorted([f"{k}={v}" for k, v in request.args.items() if k.lower().startswith("h_")]))
-    cache_key = f"{m3u_url}|{cache_key_headers}"
-
-    # Controlla se la risposta è già in cache
-    if cache_key in M3U8_CACHE:
-        app.logger.info(f"Cache HIT per M3U8: {m3u_url}")
-        cached_response = M3U8_CACHE[cache_key]
-        return Response(cached_response, content_type="application/vnd.apple.mpegurl; charset=utf-8")
-    
-    app.logger.info(f"Cache MISS per M3U8: {m3u_url}")
-
+    # Header di default aggiornati per DaddyLive 2025
     default_headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/33.0 Mobile/15E148 Safari/605.1.15",
-        "Referer": "https://vavoo.to/",
-        "Origin": "https://vavoo.to"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Referer": "https://daddylive.mp/",
+        "Origin": "https://daddylive.mp"
     }
 
+    # Estrai gli header dalla richiesta, sovrascrivendo i default
     request_headers = {
         unquote(key[2:]).replace("_", "-"): unquote(value).strip()
         for key, value in request.args.items()
         if key.lower().startswith("h_")
     }
-    
+
     headers = {**default_headers, **request_headers}
 
-    processed_url = m3u_url
+    # Processa URL con nuova logica DaddyLive 2025
+    processed_url = process_daddylive_url(m3u_url)
 
     try:
+        print(f"Chiamata a resolve_m3u8_link per URL processato: {processed_url}")
         result = resolve_m3u8_link(processed_url, headers)
-
         if not result["resolved_url"]:
             return "Errore: Impossibile risolvere l'URL in un M3U8 valido.", 500
 
         resolved_url = result["resolved_url"]
         current_headers_for_proxy = result["headers"]
 
-        proxy_config = get_proxy_config_for_url(resolved_url)
-        if proxy_config['proxies']:
-            app.logger.debug(f"Proxy in uso per GET {resolved_url}")
+        print(f"Risoluzione completata. URL M3U8 finale: {resolved_url}")
 
-        m3u_response = requests.get(resolved_url, headers=current_headers_for_proxy, 
-                                   proxies=proxy_config['proxies'], allow_redirects=True, timeout=(10, 20),
-                                   verify=proxy_config['verify'])
+        # CORREZIONE: Verifica che sia un M3U8 valido (senza parametri proxy)
+        if not resolved_url.endswith('.m3u8'):
+            print(f"URL risolto non è un M3U8: {resolved_url}")
+            return "Errore: Impossibile ottenere un M3U8 valido dal canale", 500
+
+        # Fetchare il contenuto M3U8 effettivo dall'URL pulito
+        print(f"Fetching M3U8 content from clean URL: {resolved_url}")
+        print(f"Using headers: {current_headers_for_proxy}")
+
+        m3u_response = requests.get(resolved_url, headers=current_headers_for_proxy, allow_redirects=True, timeout=5)
         m3u_response.raise_for_status()
-        m3u_response.encoding = m3u_response.apparent_encoding or 'utf-8'
+
         m3u_content = m3u_response.text
         final_url = m3u_response.url
 
+        # Processa il contenuto M3U8
         file_type = detect_m3u_type(m3u_content)
-
         if file_type == "m3u":
-            return Response(m3u_content, content_type="application/vnd.apple.mpegurl; charset=utf-8")
+            return Response(m3u_content, content_type="application/vnd.apple.mpegurl")
 
+        # Processa contenuto M3U8
         parsed_url = urlparse(final_url)
         base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.rsplit('/', 1)[0]}/"
 
+        # Prepara la query degli header per segmenti/chiavi proxati
         headers_query = "&".join([f"h_{quote(k)}={quote(v)}" for k, v in current_headers_for_proxy.items()])
 
         modified_m3u8 = []
         for line in m3u_content.splitlines():
             line = line.strip()
-            if line.startswith("#EXT-X-KEY:"):
-                # Regex to find the URI attribute, handling quotes
-                uri_match = re.search(r'URI="([^"]+)"', line)
-                if uri_match:
-                    key_uri = uri_match.group(1)
-                    # Make the key URI absolute
-                    absolute_key_uri = urljoin(base_url, key_uri)
-                    # Create the proxied key URL
-                    proxied_key_url = f"/proxy/key?url={quote(absolute_key_uri)}&{headers_query}"
-                    # Replace the original URI with the proxied one
-                    modified_line = line.replace(key_uri, proxied_key_url)
-                    modified_m3u8.append(modified_line)
-                else:
-                    # If URI is not found, append the line as is
-                    modified_m3u8.append(line)
+            if line.startswith("#EXT-X-KEY") and 'URI="' in line:
+                line = replace_key_uri(line, headers_query)
             elif line and not line.startswith("#"):
                 segment_url = urljoin(base_url, line)
                 line = f"/proxy/ts?url={quote(segment_url)}&{headers_query}"
             modified_m3u8.append(line)
 
         modified_m3u8_content = "\n".join(modified_m3u8)
-        
-        # Salva il contenuto modificato nella cache prima di restituirlo
-        M3U8_CACHE[cache_key] = modified_m3u8_content
-        
-        return Response(modified_m3u8_content, content_type="application/vnd.apple.mpegurl; charset=utf-8")
+        return Response(modified_m3u8_content, content_type="application/vnd.apple.mpegurl")
 
     except requests.RequestException as e:
-        return f"Errore durante il download o la risoluzione del file: {str(e)}", 500
+        print(f"Errore durante il download o la risoluzione del file: {str(e)}")
+        return f"Errore durante il download o la risoluzione del file M3U/M3U8: {str(e)}", 500
     except Exception as e:
-        return f"Errore generico nella funzione proxy_m3u: {str(e)}", 500
+        print(f"Errore generico nella funzione proxy_m3u: {str(e)}")
+        return f"Errore generico durante l'elaborazione: {str(e)}", 500
 
-@app.route('/proxy/key')
-def proxy_key():
-    """Proxy per chiavi di decrittazione AES con caching e headers."""
-    key_url = request.args.get('url', '').strip()
-    if not key_url:
-        return "Errore: Parametro 'url' per la chiave mancante", 400
 
-    # Crea una chiave di cache basata sull'URL della chiave
-    cache_key = key_url
+@app.route('/proxy/resolve')
+def proxy_resolve():
+    """Proxy per risolvere e restituire un URL M3U8 con metodo DaddyLive 2025"""
+    periodic_cleanup()
 
-    if cache_key in KEY_CACHE:
-        app.logger.info(f"Cache HIT per KEY: {key_url}")
-        return Response(KEY_CACHE[cache_key], content_type="application/octet-stream")
+    url = request.args.get('url', '').strip()
+    if not url:
+        return "Errore: Parametro 'url' mancante", 400
 
-    app.logger.info(f"Cache MISS per KEY: {key_url}")
+    # AGGIUNTA: Header di default identici a /proxy/m3u
+    default_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Referer": "https://daddylive.mp/",
+        "Origin": "https://daddylive.mp"
+    }
 
-    headers = {
+    # Estrai gli header dalla richiesta, sovrascrivendo i default
+    request_headers = {
         unquote(key[2:]).replace("_", "-"): unquote(value).strip()
         for key, value in request.args.items()
         if key.lower().startswith("h_")
     }
 
-    proxy_config = get_proxy_config_for_url(key_url)
-    if proxy_config['proxies']:
-        app.logger.debug(f"Proxy in uso per la chiave {key_url}")
+    headers = {**default_headers, **request_headers}
 
     try:
-        response = requests.get(key_url, headers=headers, proxies=proxy_config['proxies'], timeout=(10, 20), verify=proxy_config['verify'])
-        response.raise_for_status()
-        
-        key_content = response.content
-        
-        if key_content:
-            KEY_CACHE[cache_key] = key_content
-        
-        return Response(key_content, content_type="application/octet-stream")
-    except requests.RequestException as e:
-        return f"Errore durante il download della chiave: {str(e)}", 500
+        processed_url = process_daddylive_url(url)
+        result = resolve_m3u8_link(processed_url, headers)
+        if not result["resolved_url"]:
+            return "Errore: Impossibile risolvere l'URL", 500
+
+        headers_query = "&".join([f"h_{quote(k)}={quote(v)}" for k, v in result["headers"].items()])
+        return Response(
+            f"#EXTM3U\n"
+            f"#EXTINF:-1,Canale Risolto\n"
+            f"/proxy/m3u?url={quote(result['resolved_url'])}&{headers_query}",
+            content_type="application/vnd.apple.mpegurl"
+        )
+
+    except Exception as e:
+        return f"Errore durante la risoluzione dell'URL: {str(e)}", 500
+
 
 @app.route('/proxy/ts')
 def proxy_ts():
-    """Proxy per segmenti .TS con caching, headers personalizzati e supporto proxy."""
+    """Proxy per segmenti .TS con headers personalizzati e caching ottimizzato"""
+    periodic_cleanup()
+
     ts_url = request.args.get('url', '').strip()
     if not ts_url:
         return "Errore: Parametro 'url' mancante", 400
 
-    # Controlla se il segmento è in cache
-    if ts_url in TS_CACHE:
-        app.logger.info(f"Cache HIT per TS: {ts_url}")
-        # Restituisce il contenuto direttamente dalla cache
-        return Response(TS_CACHE[ts_url], content_type="video/mp2t")
+    headers = {
+        unquote(key[2:]).replace("_", "-"): unquote(value).strip()
+        for key, value in request.args.items()
+        if key.lower().startswith("h_")
+    }
 
-    app.logger.info(f"Cache MISS per TS: {ts_url}")
+    # Controlla cache
+    cached_data = ts_cache.get(ts_url)
+    if cached_data:
+        return Response(cached_data, content_type="video/mp2t")
+
+    try:
+        response = requests.get(ts_url, headers=headers, stream=True, allow_redirects=True, timeout=10)
+        response.raise_for_status()
+
+        # Leggi in chunks per evitare di caricare tutto in memoria
+        data = b''
+        for chunk in response.iter_content(chunk_size=8192):
+            data += chunk
+            # Limite di sicurezza per evitare segmenti troppo grandi
+            if len(data) > MAX_TS_SIZE:
+                break
+
+        # Carica in cache solo se non troppo grande
+        if len(data) <= MAX_TS_SIZE:
+            ts_cache.put(ts_url, data)
+
+        return Response(data, content_type="video/mp2t")
+
+    except requests.RequestException as e:
+        return f"Errore durante il download del segmento TS: {str(e)}", 500
+
+@app.route('/proxy/key')
+def proxy_key():
+    """Proxy per la chiave AES-128 con header personalizzati"""
+    key_url = request.args.get('url', '').strip()
+    if not key_url:
+        return "Errore: Parametro 'url' mancante per la chiave", 400
 
     headers = {
         unquote(key[2:]).replace("_", "-"): unquote(value).strip()
@@ -536,60 +516,50 @@ def proxy_ts():
         if key.lower().startswith("h_")
     }
 
-    proxy_config = get_proxy_config_for_url(ts_url)
-    if proxy_config['proxies']:
-        app.logger.debug(f"Proxy in uso per {ts_url}")
+    # Controlla cache per le chiavi
+    cached_key = key_cache.get(key_url)
+    if cached_key:
+        return Response(cached_key, content_type="application/octet-stream")
 
     try:
-        # Nota: stream=False per scaricare l'intero segmento e poterlo mettere in cache
-        response = requests.get(ts_url, headers=headers, proxies=proxy_config['proxies'], stream=False, allow_redirects=True, timeout=(10, 30), verify=proxy_config['verify'])
+        response = requests.get(key_url, headers=headers, allow_redirects=True, timeout=10)
         response.raise_for_status()
-        
-        ts_content = response.content
-        
-        # Salva il contenuto del segmento nella cache
-        if ts_content:
-            TS_CACHE[ts_url] = ts_content
-        
-        return Response(ts_content, content_type="video/mp2t")
-    
+
+        # Le chiavi sono piccole, cachale sempre
+        key_cache.put(key_url, response.content)
+
+        return Response(response.content, content_type="application/octet-stream")
+
     except requests.RequestException as e:
-        return f"Errore durante il download del segmento TS: {str(e)}", 500
+        return f"Errore durante il download della chiave AES-128: {str(e)}", 500
 
-@app.route('/proxyd')
-def proxyd():
-    """
-    Endpoint per proxyare i link di Daddylive.sx.
-    Estrae il link M3U8 effettivo e reindirizza a /proxy/m3u.
-    """
-    daddylive_url = request.args.get('url', '').strip()
-    if not daddylive_url:
-        return "Errore: Parametro 'url' mancante per Daddylive.", 400
+@app.route('/cache/stats')
+def cache_stats():
+    """Endpoint per monitorare lo stato della cache"""
+    return {
+        "ts_cache_size": len(ts_cache.cache),
+        "ts_cache_bytes": ts_cache.current_size,
+        "key_cache_size": len(key_cache.cache),
+        "key_cache_bytes": key_cache.current_size,
+        "total_bytes": ts_cache.current_size + key_cache.current_size,
+        "max_total_bytes": MAX_TOTAL_CACHE_SIZE,
+        "cache_ttl": CACHE_TTL,
+        "max_ts_size": MAX_TS_SIZE
+    }
 
-    app.logger.info(f"Received Daddylive proxy request for: {daddylive_url}")
-
-    try:
-        # Extract the final M3U8 URL and headers
-        extracted_info = extract_daddylive_stream(daddylive_url, request.headers)
-        final_m3u8_url = extracted_info["resolved_url"]
-        final_headers = extracted_info["headers"]
-
-        if not final_m3u8_url:
-            app.logger.error(f"Daddylive extraction returned no URL for {daddylive_url}")
-            return "Errore: Impossibile estrarre il link Daddylive.", 500
-
-        # Redirect to /proxy/m3u with the extracted URL and headers
-        headers_query_string = "&".join([f"h_{quote(k)}={quote(v)}" for k, v in final_headers.items()])
-        return_url = f"/proxy/m3u?url={quote(final_m3u8_url)}&{headers_query_string}"
-        return Response(status=302, headers={'Location': return_url})
-    except Exception as e:
-        app.logger.error(f"Error processing Daddylive proxy request for {daddylive_url}: {e}", exc_info=True)
-        return f"Errore durante l'elaborazione del link Daddylive: {str(e)}", 500
+@app.route('/cache/clear')
+def clear_cache():
+    """Endpoint per svuotare manualmente la cache"""
+    ts_cache.clear()
+    key_cache.clear()
+    gc.collect()
+    return "Cache svuotata con successo"
 
 @app.route('/')
 def index():
     """Pagina principale che mostra un messaggio di benvenuto"""
-    return "Proxy started!"
+    return "Proxy DaddyLive 2025 - Metodo Addon.py Funzionante!"
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=7860, debug=False)
+    print("Proxy DaddyLive 2025 - Metodo Addon.py Funzionante!")
+    app.run(host="0.0.0.0", port=7860, debug=True)
